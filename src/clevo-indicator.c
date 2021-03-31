@@ -74,7 +74,7 @@
 #define MAX_FAN_RPM 4400.0
 
 typedef enum {
-    NA = 0, AUTO = 1, MANUAL = 2
+    NA = 0, AUTO = 1, MANUAL_CPU = 2, MANUAL_GPU = 3
 } MenuItemType;
 
 typedef enum {
@@ -91,10 +91,10 @@ static int main_test_fan(int cpu_duty, int gpu_duty);
 static gboolean ui_update(gpointer user_data);
 static void ui_command_set_fan(long fan_duty);
 static void ui_command_quit(gchar* command);
-static void ui_toggle_menuitems(int fan_duty);
+static void ui_toggle_menuitems(int cpu_fan_duty, int gpu_fan_duty);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
-static int ec_auto_duty_adjust(void);
+static int ec_auto_duty_adjust(int temp);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
 static int ec_query_fan_duty(void);
@@ -121,14 +121,23 @@ struct {
     GtkWidget* widget;
 
 }static menuitems[] = {
-        { "Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL },
+        { "Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0,             AUTO,       NULL },
         { "", NULL, 0L, NA, NULL },
-        { "Set FAN to  60%", G_CALLBACK(ui_command_set_fan), 60, MANUAL, NULL },
-        { "Set FAN to  70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL },
-        { "Set FAN to  80%", G_CALLBACK(ui_command_set_fan), 80, MANUAL, NULL },
-        { "Set FAN to  90%", G_CALLBACK(ui_command_set_fan), 90, MANUAL, NULL },
-        { "Set FAN to 100%", G_CALLBACK(ui_command_set_fan), 100, MANUAL, NULL },
+        { "Set CPU FAN to  40%", G_CALLBACK(ui_command_set_fan), CPU | 40,  MANUAL_CPU, NULL },
+        { "Set CPU FAN to  50%", G_CALLBACK(ui_command_set_fan), CPU | 50,  MANUAL_CPU, NULL },
+        { "Set CPU FAN to  60%", G_CALLBACK(ui_command_set_fan), CPU | 60,  MANUAL_CPU, NULL },
+        { "Set CPU FAN to  70%", G_CALLBACK(ui_command_set_fan), CPU | 70,  MANUAL_CPU, NULL },
+        { "Set CPU FAN to  80%", G_CALLBACK(ui_command_set_fan), CPU | 80,  MANUAL_CPU, NULL },
+        { "Set CPU FAN to  90%", G_CALLBACK(ui_command_set_fan), CPU | 90,  MANUAL_CPU, NULL },
+        { "Set CPU FAN to 100%", G_CALLBACK(ui_command_set_fan), CPU | 100, MANUAL_CPU, NULL },
         { "", NULL, 0L, NA, NULL },
+        { "Set GPU FAN to  40%", G_CALLBACK(ui_command_set_fan), 40,  MANUAL_GPU, NULL },
+        { "Set GPU FAN to  50%", G_CALLBACK(ui_command_set_fan), 50,  MANUAL_GPU, NULL },
+        { "Set GPU FAN to  60%", G_CALLBACK(ui_command_set_fan), 60,  MANUAL_GPU, NULL },
+        { "Set GPU FAN to  70%", G_CALLBACK(ui_command_set_fan), 70,  MANUAL_GPU, NULL },
+        { "Set GPU FAN to  80%", G_CALLBACK(ui_command_set_fan), 80,  MANUAL_GPU, NULL },
+        { "Set GPU FAN to  90%", G_CALLBACK(ui_command_set_fan), 90,  MANUAL_GPU, NULL },
+        { "Set GPU FAN to 100%", G_CALLBACK(ui_command_set_fan), 100, MANUAL_GPU, NULL },
         { "Quit", G_CALLBACK(ui_command_quit), 0L, NA, NULL }
 };
 
@@ -138,12 +147,16 @@ struct {
     volatile int exit;
     volatile int cpu_temp;
     volatile int gpu_temp;
-    volatile int fan_duty;
+    volatile int cpu_fan_duty;
+    volatile int gpu_fan_duty;
     volatile int fan_rpms;
     volatile int auto_duty;
-    volatile int auto_duty_val;
-    volatile int manual_next_fan_duty;
-    volatile int manual_prev_fan_duty;
+    volatile int auto_cpu_duty_val;
+    volatile int auto_gpu_duty_val;
+    volatile int manual_next_cpu_fan_duty;
+    volatile int manual_next_gpu_fan_duty;
+    volatile int manual_prev_cpu_fan_duty;
+    volatile int manual_prev_gpu_fan_duty;
 }static *share_info = NULL;
 
 static pid_t parent_pid = 0;
@@ -249,17 +262,20 @@ static void main_init_share(void) {
     share_info->exit = 0;
     share_info->cpu_temp = 0;
     share_info->gpu_temp = 0;
-    share_info->fan_duty = 0;
+    share_info->cpu_fan_duty = 0;
+    share_info->gpu_fan_duty = 0;
     share_info->fan_rpms = 0;
     share_info->auto_duty = 1;
-    share_info->auto_duty_val = 0;
-    share_info->manual_next_fan_duty = 0;
-    share_info->manual_prev_fan_duty = 0;
+    share_info->auto_cpu_duty_val = 0;
+    share_info->auto_gpu_duty_val = 0;
+    share_info->manual_next_cpu_fan_duty = 0;
+    share_info->manual_prev_cpu_fan_duty = 0;
 }
 
 static int main_ec_worker(void) {
     setuid(0);
-    system("modprobe ec_sys");
+    // Note: Add `ec_sys` to `/etc/modules-load.d/` lists
+    // system("modprobe ec_sys");
     while (share_info->exit == 0) {
         // check parent
         if (parent_pid != 0 && kill(parent_pid, 0) == -1) {
@@ -267,53 +283,50 @@ static int main_ec_worker(void) {
             break;
         }
         // write EC
-        int new_fan_duty = share_info->manual_next_fan_duty;
-        if (new_fan_duty != 0
-                && new_fan_duty != share_info->manual_prev_fan_duty) {
-            ec_write_fan_duty(CPU, new_fan_duty);
-            share_info->manual_prev_fan_duty = new_fan_duty;
+        int new_cpu_fan_duty = share_info->manual_next_cpu_fan_duty;
+        if (new_cpu_fan_duty != 0
+            && new_cpu_fan_duty != share_info->manual_prev_cpu_fan_duty) {
+            ec_write_fan_duty(CPU, new_cpu_fan_duty);
+            share_info->manual_prev_cpu_fan_duty = new_cpu_fan_duty;
+        }
+        int new_gpu_fan_duty = share_info->manual_next_gpu_fan_duty;
+        if (new_gpu_fan_duty != 0
+            && new_gpu_fan_duty != share_info->manual_prev_gpu_fan_duty) {
+            ec_write_fan_duty(GPU1, new_gpu_fan_duty);
+            ec_write_fan_duty(GPU2, new_gpu_fan_duty);
+            share_info->manual_prev_gpu_fan_duty = new_gpu_fan_duty;
         }
         // read EC
-        int io_fd = open("/sys/kernel/debug/ec/ec0/io", O_RDONLY, 0);
-        if (io_fd < 0) {
-            printf("unable to read EC from sysfs: %s\n", strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-        unsigned char buf[EC_REG_SIZE];
-        ssize_t len = read(io_fd, buf, EC_REG_SIZE);
-        switch (len) {
-        case -1:
-            printf("unable to read EC from sysfs: %s\n", strerror(errno));
-            break;
-        case 0x100:
-            share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
-            share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
-            share_info->fan_duty = calculate_fan_duty(buf[EC_REG_FAN_DUTY]);
-            share_info->fan_rpms = calculate_fan_rpms(buf[EC_REG_FAN_RPMS_HI],
-                    buf[EC_REG_FAN_RPMS_LO]);
-            /*
-             printf("temp=%d, duty=%d, rpms=%d\n", share_info->cpu_temp,
-             share_info->fan_duty, share_info->fan_rpms);
-             */
-            break;
-        default:
-            printf("wrong EC size from sysfs: %ld\n", len);
-        }
-        close(io_fd);
+        share_info->cpu_temp = ec_query_cpu_temp();
+        share_info->gpu_temp = ec_query_gpu_temp();
+        share_info->cpu_fan_duty = ec_query_fan_duty();
+        share_info->gpu_fan_duty = ec_query_fan_duty();      // TODO: Query GPU Fan duty
+        share_info->fan_rpms = ec_query_fan_duty();
+
         // auto EC
         if (share_info->auto_duty == 1) {
-            int next_duty = ec_auto_duty_adjust();
-            if (next_duty != 0 && next_duty != share_info->auto_duty_val) {
+            int next_cpu_duty = ec_auto_duty_adjust(share_info->cpu_temp);
+            if (next_cpu_duty != 0 && next_cpu_duty != share_info->auto_cpu_duty_val) {
                 char s_time[256];
                 get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                printf("%s CPU=%d°C, GPU=%d°C, auto fan duty to %d%%\n", s_time,
-                        share_info->cpu_temp, share_info->gpu_temp, next_duty);
-                ec_write_fan_duty(CPU, next_duty);
-                share_info->auto_duty_val = next_duty;
+                printf("%s CPU=%d°C, auto cpu fan duty to %d%%\n", s_time,
+                       share_info->cpu_temp, next_cpu_duty);
+                ec_write_fan_duty(CPU, next_cpu_duty);
+                share_info->auto_cpu_duty_val = next_cpu_duty;
+            }
+            int next_gpu_duty = ec_auto_duty_adjust(share_info->gpu_temp);
+            if (next_gpu_duty != 0 && next_gpu_duty != share_info->auto_gpu_duty_val) {
+                char s_time[256];
+                get_time_string(s_time, 256, "%m/%d %H:%M:%S");
+                printf("%s GPU=%d°C, auto gpu fan duty to %d%%\n", s_time,
+                       share_info->gpu_temp, next_gpu_duty);
+                ec_write_fan_duty(GPU1, next_gpu_duty);
+                ec_write_fan_duty(GPU2, next_gpu_duty);
+                share_info->auto_gpu_duty_val = next_gpu_duty;
             }
         }
         //
-        usleep(200 * 1000);
+        usleep(10 * 1000);
     }
     printf("worker quit\n");
     return EXIT_SUCCESS;
@@ -351,7 +364,7 @@ static void main_ui_worker(int argc, char** argv) {
     app_indicator_set_title(indicator, "Clevo");
     app_indicator_set_menu(indicator, GTK_MENU(indicator_menu));
     g_timeout_add(500, &ui_update, NULL);
-    ui_toggle_menuitems(share_info->fan_duty);
+    ui_toggle_menuitems(share_info->cpu_fan_duty, share_info->gpu_fan_duty);
     gtk_main();
     printf("main on UI quit\n");
 }
@@ -405,15 +418,22 @@ static void ui_command_set_fan(long fan_duty) {
     if (fan_duty_val == 0) {
         printf("clicked on fan duty auto\n");
         share_info->auto_duty = 1;
-        share_info->auto_duty_val = 0;
-        share_info->manual_next_fan_duty = 0;
+        share_info->auto_cpu_duty_val = 0;
+        share_info->auto_gpu_duty_val = 0;
+        share_info->manual_next_cpu_fan_duty = 0;
+        share_info->manual_next_gpu_fan_duty = 0;
     } else {
-        printf("clicked on fan duty: %d\n", fan_duty_val);
+        int is_cpu = fan_duty & CPU;
+        printf("clicked on %s fan duty: %d\n", (is_cpu ? "CPU" : "GPU"), fan_duty_val);
         share_info->auto_duty = 0;
-        share_info->auto_duty_val = 0;
-        share_info->manual_next_fan_duty = fan_duty_val;
+        share_info->auto_cpu_duty_val = 0;
+        share_info->auto_gpu_duty_val = 0;
+        if (is_cpu)
+            share_info->manual_next_cpu_fan_duty = fan_duty_val;
+        else
+            share_info->manual_next_gpu_fan_duty = fan_duty_val;
     }
-    ui_toggle_menuitems(fan_duty_val);
+    ui_toggle_menuitems(share_info->manual_next_cpu_fan_duty, share_info->manual_next_gpu_fan_duty);
 }
 
 static void ui_command_quit(gchar* command) {
@@ -421,17 +441,18 @@ static void ui_command_quit(gchar* command) {
     gtk_main_quit();
 }
 
-static void ui_toggle_menuitems(int fan_duty) {
+static void ui_toggle_menuitems(int cpu_fan_duty, int gpu_fan_duty) {
+    printf("%d %d\n", cpu_fan_duty, gpu_fan_duty);
     for (int i = 0; i < menuitem_count; i++) {
         if (menuitems[i].widget == NULL)
             continue;
-        if (fan_duty == 0)
+        if (cpu_fan_duty == 0)
             gtk_widget_set_sensitive(menuitems[i].widget,
-                    menuitems[i].type != AUTO);
+                    !(menuitems[i].type == AUTO));
         else
             gtk_widget_set_sensitive(menuitems[i].widget,
-                    menuitems[i].type != MANUAL
-                            || (int) menuitems[i].option != fan_duty);
+                                     !(menuitems[i].type == MANUAL_CPU && (int) menuitems[i].option == cpu_fan_duty ||
+                                             menuitems[i].type == MANUAL_GPU && (int) menuitems[i].option == gpu_fan_duty));
     }
 }
 
@@ -449,42 +470,19 @@ static void ec_on_sigterm(int signum) {
         share_info->exit = 1;
 }
 
-static int ec_auto_duty_adjust(void) {
-    int temp = MAX(share_info->cpu_temp, share_info->gpu_temp);
-    int duty = share_info->fan_duty;
-    //
-    if (temp >= 80 && duty < 100)
-        return 100;
-    if (temp >= 70 && duty < 90)
-        return 90;
-    if (temp >= 60 && duty < 80)
-        return 80;
-    if (temp >= 50 && duty < 70)
-        return 70;
-    if (temp >= 40 && duty < 60)
-        return 60;
-    if (temp >= 30 && duty < 50)
-        return 50;
-    if (temp >= 20 && duty < 40)
-        return 40;
-    if (temp >= 10 && duty < 30)
-        return 30;
-    //
-    if (temp <= 15 && duty > 30)
-        return 30;
-    if (temp <= 25 && duty > 40)
-        return 40;
-    if (temp <= 35 && duty > 50)
-        return 50;
-    if (temp <= 45 && duty > 60)
-        return 60;
-    if (temp <= 55 && duty > 70)
-        return 70;
-    if (temp <= 65 && duty > 80)
-        return 80;
-    if (temp <= 75 && duty > 90)
-        return 90;
-    //
+static int ec_auto_duty_adjust(int temp) {
+    if (temp >= 90) return 70;
+    if (temp >= 85) return 65;
+    if (temp >= 80) return 60;
+    if (temp >= 75) return 55;
+    if (temp >= 70) return 50;
+    if (temp >= 65) return 50;
+    if (temp >= 60) return 50;
+    if (temp >= 55) return 50;
+    if (temp >= 50) return 50;
+    if (temp >= 45) return 50;
+    if (temp >= 40) return 50;
+
     return 0;
 }
 
